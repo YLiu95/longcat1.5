@@ -8,7 +8,6 @@ Single-process, multi-GPU with:
 """
 
 import os
-os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 import sys
 import gc
 import json
@@ -49,7 +48,7 @@ CONFIG = {
     "num_inference_steps": 8,       # 8 for distill mode (required for v1.5)
     "text_guidance_scale": 1.0,     # 1.0 for distill mode
     "audio_guidance_scale": 1.0,    # 1.0 for distill mode
-    "num_frames": 49,               # 49 frames @ 25fps = ~1.96s (reduced for T4 memory)
+    "num_frames": 93,               # 93 frames @ 25fps = ~3.72s
     "save_fps": 25,
     "seed": 42,
     "use_distill": True,
@@ -69,8 +68,7 @@ def log_gpu_memory(label=""):
     for i in range(torch.cuda.device_count()):
         allocated = torch.cuda.memory_allocated(i) / 1024**3
         reserved = torch.cuda.memory_reserved(i) / 1024**3
-        total = (getattr(torch.cuda.get_device_properties(i), 'total_memory', None) or 
-                getattr(torch.cuda.get_device_properties(i), 'total_mem', 0)) / 1024**3
+        total = torch.cuda.get_device_properties(i).total_mem / 1024**3
         log.info(f"  GPU{i} [{label}]: {allocated:.2f}GB alloc / {reserved:.2f}GB reserved / {total:.2f}GB total")
 
 
@@ -102,42 +100,59 @@ def encode_text(prompt, negative_prompt, base_model_dir, device="cuda:0"):
     # Load tokenizer (tiny, stays in RAM)
     tokenizer = AutoTokenizer.from_pretrained(base_model_dir, subfolder="tokenizer")
 
-    # Load text encoder - force split across both GPUs (each T4 has ~14.6GB,
-    # model is ~14.4GB so we MUST split to leave room for activations)
-    log.info("  Loading UMT5 text encoder (split across 2 GPUs)...")
-    max_mem = {0: "8GiB", 1: "8GiB"}  # Force even split
+    # Load text encoder to GPU
+    log.info("  Loading UMT5 text encoder to GPU...")
     text_encoder = UMT5EncoderModel.from_pretrained(
-        base_model_dir, subfolder="text_encoder", torch_dtype=torch.bfloat16,
-        device_map="auto", max_memory=max_mem,
-    ).eval()
+        base_model_dir, subfolder="text_encoder", torch_dtype=torch.bfloat16
+    ).to(device).eval()
     log_gpu_memory("text_encoder loaded")
 
     max_seq_len = CONFIG["max_sequence_length"]
-    # Find the device where inputs should go (first layer's device)
-    encoder_device = next(text_encoder.parameters()).device
 
-    def _encode_one(text):
-        cleaned = prompt_clean(text)
-        inputs = tokenizer(
-            [cleaned], padding="max_length", max_length=max_seq_len,
-            truncation=True, add_special_tokens=True,
-            return_attention_mask=True, return_tensors="pt",
-        )
-        with torch.no_grad():
-            embeds = text_encoder(
-                inputs.input_ids.to(encoder_device),
-                inputs.attention_mask.to(encoder_device),
-            ).last_hidden_state
-        # Move to CPU immediately to free GPU memory
-        embeds = embeds.to(dtype=torch.bfloat16, device="cpu").unsqueeze(1)
-        mask = inputs.attention_mask.clone()
-        return embeds, mask
+    # Encode prompt
+    prompt_clean_text = prompt_clean(prompt)
+    text_inputs = tokenizer(
+        [prompt_clean_text],
+        padding="max_length",
+        max_length=max_seq_len,
+        truncation=True,
+        add_special_tokens=True,
+        return_attention_mask=True,
+        return_tensors="pt",
+    )
+    with torch.no_grad():
+        prompt_embeds = text_encoder(
+            text_inputs.input_ids.to(device),
+            text_inputs.attention_mask.to(device)
+        ).last_hidden_state
+    prompt_embeds = prompt_embeds.to(dtype=torch.bfloat16, device=device)
+    prompt_mask = text_inputs.attention_mask.to(device)
+    # Reshape: [B, seq, C] -> [B, 1, seq, C]
+    prompt_embeds = prompt_embeds.unsqueeze(1)
 
-    prompt_embeds, prompt_mask = _encode_one(prompt)
-    neg_embeds, neg_mask = _encode_one(negative_prompt)
+    # Encode negative prompt
+    neg_clean = prompt_clean(negative_prompt)
+    neg_inputs = tokenizer(
+        [neg_clean],
+        padding="max_length",
+        max_length=max_seq_len,
+        truncation=True,
+        add_special_tokens=True,
+        return_attention_mask=True,
+        return_tensors="pt",
+    )
+    with torch.no_grad():
+        neg_embeds = text_encoder(
+            neg_inputs.input_ids.to(device),
+            neg_inputs.attention_mask.to(device)
+        ).last_hidden_state
+    neg_embeds = neg_embeds.to(dtype=torch.bfloat16, device=device)
+    neg_mask = neg_inputs.attention_mask.to(device)
+    neg_embeds = neg_embeds.unsqueeze(1)
+
     caption_channels = text_encoder.config.d_model
 
-    # Unload text encoder from both GPUs
+    # Unload text encoder
     del text_encoder
     torch_gc()
     log.info(f"  Text encoding done in {time.time()-start:.1f}s")
@@ -449,9 +464,6 @@ def run_dit_generation(
     log.info("=== Phase 4: DiT Generation ===")
     start = time.time()
 
-    # Free GPU reserved memory before loading DiT (frees ~6GB on GPU0)
-    torch_gc()
-
     split_point = CONFIG["split_point"]
     num_inference_steps = CONFIG["num_inference_steps"]
     text_guidance_scale = CONFIG["text_guidance_scale"]
@@ -469,54 +481,18 @@ def run_dit_generation(
     dit = load_quantized_dit(avatar_model_dir, subfolder="base_model_int8", cp_split_hw=[1, 1])
     log_gpu_memory("DiT on CPU")
 
-    # Load distillation LoRA (load weights only, enable after split)
+    # Load distillation LoRA
     if use_distill:
         lora_path = os.path.join(avatar_model_dir, 'lora', 'dmd_lora.safetensors')
         if os.path.exists(lora_path):
             log.info("  Loading distillation LoRA...")
             dit.load_lora(lora_path, "dmd", multiplier=1.0, lora_network_dim=128, lora_network_alpha=64)
+            dit.enable_loras(["dmd"])
 
     # Split across GPUs
     dit = split_dit_across_devices(dit, device_0, device_1, split_point)
     dit.eval()
-
-    # Force SDPA fallback: disable flash_attn/xformers flags on all attention modules
-    for module in dit.modules():
-        if hasattr(module, 'enable_flashattn2'):
-            module.enable_flashattn2 = False
-        if hasattr(module, 'enable_flashattn3'):
-            module.enable_flashattn3 = False
-        if hasattr(module, 'enable_xformers'):
-            module.enable_xformers = False
-        if hasattr(module, 'enable_bsa'):
-            module.enable_bsa = False
-
     log_gpu_memory("DiT split across GPUs")
-
-    # Enable LoRA after split - move each LoRA to the device of its target module
-    if use_distill and "dmd" in dit.lora_dict:
-        dit.disable_all_loras()
-        module_loras = {}
-        for lora in dit.lora_dict["dmd"].loras:
-            module_name = lora.lora_name.replace("lora___lorahyphen___", "").replace("___lorahyphen___", ".")
-            if module_name not in module_loras:
-                module_loras[module_name] = []
-            module_loras[module_name].append(lora)
-        for module_name, loras in module_loras.items():
-            module = dit._get_module_by_name(module_name)
-            # Get device of the target module (check both parameters and buffers for QuantizedLinear)
-            import itertools
-            try:
-                target_device = next(itertools.chain(module.parameters(), module.buffers())).device
-            except StopIteration:
-                target_device = device_0
-            target_dtype = torch.bfloat16
-            for lora in loras:
-                lora.to(target_device, dtype=target_dtype, non_blocking=True)
-            if not hasattr(module, 'org_forward'):
-                module.org_forward = module.forward
-            module.forward = dit._create_multi_lora_forward(module, loras)
-        dit.active_loras.append("dmd")
 
     # Prepare timesteps
     _num_timesteps = 1000
@@ -582,10 +558,6 @@ def run_dit_generation(
 
     log.info(f"  Starting denoising: {len(timesteps)} steps, {'CFG' if do_cfg else 'no CFG'}")
     log.info(f"  Latent shape: {latents.shape}, Audio embs: {audio_embs.shape}")
-
-    # Free fragmented GPU memory before denoising
-    torch_gc()
-    log_gpu_memory("Before denoising")
 
     # Denoising loop
     with torch.no_grad():
@@ -763,8 +735,7 @@ def main():
     log.info(f"GPUs available: {num_gpus}")
     for i in range(num_gpus):
         props = torch.cuda.get_device_properties(i)
-        total = getattr(props, 'total_memory', None) or getattr(props, 'total_mem', 0)
-        log.info(f"  GPU{i}: {props.name}, {total/1024**3:.1f}GB")
+        log.info(f"  GPU{i}: {props.name}, {props.total_mem/1024**3:.1f}GB")
 
     if num_gpus < 2:
         log.warning("Only 1 GPU available - will try to fit on single GPU")
