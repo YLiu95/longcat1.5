@@ -69,25 +69,34 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ============================================================
-# Configuration
+# Configuration — defaults, overridden by config.json
 # ============================================================
 CONFIG = {
     "base_model_dir": "/kaggle/tmp/weights/LongCat-Video",
     "avatar_model_dir": "/kaggle/tmp/weights/LongCat-Video-Avatar-1.5",
     "input_json": "/kaggle/tmp/input.json",
     "output_dir": "/kaggle/working",
+    "output_name": "output",
 
     # Generation settings
-    "resolution": "480p",           # "480p" (480x832) or "720p" (768x1280)
-    "num_inference_steps": 8,       # 8 for distill mode (required for v1.5)
-    "text_guidance_scale": 1.0,     # 1.0 for distill mode
-    "audio_guidance_scale": 1.0,    # 1.0 for distill mode
-    "num_frames": 49,               # 49 frames @ 25fps = ~1.96s (reduced for T4 memory)
+    "resolution": "480p",
+    "num_inference_steps": 8,
+    "text_guidance_scale": 1.0,
+    "audio_guidance_scale": 1.0,
+    "num_frames": 49,
     "save_fps": 25,
     "seed": 42,
     "use_distill": True,
     "use_int8": True,
-    "split_point": 24,              # DiT block split: 24 = even split of 48
+    "split_point": 24,
+    "negative_prompt": (
+        "Close-up, bright tones, overexposed, static, blurred details, "
+        "subtitles, style, works, paintings, images, static, overall gray, "
+        "worst quality, low quality, JPEG compression residue, ugly, "
+        "incomplete, extra fingers, poorly drawn hands, poorly drawn faces, "
+        "deformed, disfigured, misshapen limbs, fused fingers, still picture, "
+        "messy background, three legs, many people in the background, walking backwards"
+    ),
 
     # Avatar settings
     "ref_img_index": 10,
@@ -95,6 +104,29 @@ CONFIG = {
     "model_type": "avatar-v1.5",
     "max_sequence_length": 512,
 }
+
+
+def load_config():
+    """Load config from JSON file (CLI --config or default path)."""
+    import argparse
+    parser = argparse.ArgumentParser(description="LongCat-Video-Avatar-1.5 Inference")
+    parser.add_argument("--config", type=str, default="/kaggle/tmp/config.json",
+                        help="Path to config JSON file")
+    args, _ = parser.parse_known_args()
+
+    config_path = args.config
+    if os.path.exists(config_path):
+        log.info(f"Loading config from {config_path}")
+        with open(config_path, 'r', encoding='utf-8') as f:
+            user_config = json.load(f)
+        # Merge: user config overrides defaults, skip __comment keys
+        for key, value in user_config.items():
+            if not key.startswith("__comment"):
+                CONFIG[key] = value
+        log.info(f"Config loaded: resolution={CONFIG['resolution']}, output_name={CONFIG['output_name']}, "
+                 f"steps={CONFIG['num_inference_steps']}, seed={CONFIG['seed']}")
+    else:
+        log.info(f"No config file at {config_path}, using defaults")
 
 
 def log_gpu_memory(label=""):
@@ -527,18 +559,36 @@ def dit_forward_split(model, hidden_states, timestep, encoder_hidden_states,
         encoder_hidden_states = encoder_hidden_states.squeeze(1).view(1, -1, hidden_states.shape[-1])
 
     # Process blocks 0 to split_point-1 on device_0
+    # Use async prefetch: start transferring context tensors to GPU1
+    # while GPU0 finishes its last few blocks, so both GPUs overlap work.
+    prefetch_block = max(0, split_point - 3)  # start prefetch 3 blocks early
+    transfer_stream = torch.cuda.Stream(device=device_1)
+    t_d1 = None
+    ehs_d1 = None
+    ahs_d1 = None
+
     for i in range(split_point):
         hidden_states = model.blocks[i](
             hidden_states, encoder_hidden_states, t, y_seqlens,
             (N_t, N_h, N_w), num_cond_latents,
             audio_hidden_states=audio_hidden_states,
         )
+        # After prefetch_block, async-copy context tensors to GPU1 in background
+        if i == prefetch_block:
+            with torch.cuda.stream(transfer_stream):
+                t_d1 = t.to(device_1, non_blocking=True)
+                ehs_d1 = encoder_hidden_states.to(device_1, non_blocking=True)
+                ahs_d1 = audio_hidden_states.to(device_1, non_blocking=True)
 
-    # === Transfer to device_1 ===
+    # === Transfer hidden_states to device_1 (must wait for GPU0 to finish) ===
+    # Sync the prefetch stream so context tensors are ready on GPU1
+    transfer_stream.synchronize()
     hidden_states = hidden_states.to(device_1)
-    t = t.to(device_1)
-    encoder_hidden_states = encoder_hidden_states.to(device_1)
-    audio_hidden_states = audio_hidden_states.to(device_1)
+
+    # Use pre-transferred context tensors on device_1
+    t = t_d1
+    encoder_hidden_states = ehs_d1
+    audio_hidden_states = ahs_d1
 
     # Process blocks split_point to end on device_1
     for i in range(split_point, len(model.blocks)):
@@ -930,7 +980,8 @@ def decode_and_save(all_segment_latents, base_model_dir, vae_config, audio_path,
     import imageio
     import subprocess
 
-    save_path = os.path.join(output_dir, "output")
+    output_name = CONFIG.get("output_name", "output")
+    save_path = os.path.join(output_dir, output_name)
     save_path_tmp = save_path + "-temp.mp4"
 
     video_np = (np.clip(video_frames, 0, 1) * 255).astype(np.uint8)
@@ -971,6 +1022,14 @@ def main():
     log.info("LongCat-Video-Avatar-1.5 Inference on Kaggle 2xT4")
     log.info("=" * 60)
 
+    # Load config from JSON file
+    load_config()
+
+    # Handle seed=-1 (random)
+    if CONFIG["seed"] == -1:
+        CONFIG["seed"] = int(torch.randint(0, 2**31, (1,)).item())
+        log.info(f"Random seed selected: {CONFIG['seed']}")
+
     # Evict any stale weight files from page cache at startup
     evict_file_cache("/kaggle/tmp/weights")
     log_cgroup_memory("startup")
@@ -1001,12 +1060,7 @@ def main():
     image_path = input_data['cond_image']
     audio_path = input_data['cond_audio']['person1']
 
-    negative_prompt = ("Close-up, bright tones, overexposed, static, blurred details, "
-                      "subtitles, style, works, paintings, images, static, overall gray, "
-                      "worst quality, low quality, JPEG compression residue, ugly, "
-                      "incomplete, extra fingers, poorly drawn hands, poorly drawn faces, "
-                      "deformed, disfigured, misshapen limbs, fused fingers, still picture, "
-                      "messy background, three legs, many people in the background, walking backwards")
+    negative_prompt = CONFIG.get("negative_prompt", "")
 
     # Determine resolution
     resolution = CONFIG["resolution"]

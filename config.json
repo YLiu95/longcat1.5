@@ -1,0 +1,55 @@
+{
+    "__comment__": "=== LongCat-Video-Avatar-1.5 Configuration ===",
+    "__comment_usage__": "Edit settings below, then run: python run_kaggle_avatar.py --config /kaggle/tmp/config.json",
+
+    "__comment_output_name__": "Output filename (without extension). Result: {output_dir}/{output_name}.mp4",
+    "output_name": "output",
+
+    "__comment_resolution__": "Video resolution preset. Options: '480p' (480x832, recommended for 2xT4), '720p' (768x1280, needs >16GB/GPU). Lower resolution = faster + less VRAM.",
+    "resolution": "480p",
+
+    "__comment_num_inference_steps__": "Number of denoising steps. Must be 8 for distill mode (v1.5). Higher values (20-50) only work with use_distill=false and are much slower.",
+    "num_inference_steps": 8,
+
+    "__comment_seed__": "Random seed for reproducibility. Same seed + same inputs = same output. Set to -1 for random seed each run.",
+    "seed": 42,
+
+    "__comment_text_guidance_scale__": "Text classifier-free guidance scale. Controls prompt adherence. Must be 1.0 for distill mode. For non-distill: 5.0-10.0 (higher = more prompt-following but less natural).",
+    "text_guidance_scale": 1.0,
+
+    "__comment_audio_guidance_scale__": "Audio classifier-free guidance scale. Controls lip-sync accuracy. Must be 1.0 for distill mode. For non-distill: 3.0-5.0 is optimal (higher = better sync but may cause artifacts).",
+    "audio_guidance_scale": 1.0,
+
+    "__comment_num_frames__": "Frames per video segment. 49 frames @ 25fps = ~1.96s per segment. Options: 49 (safe for T4, ~1.96s), 61 (~2.44s), 81 (~3.24s), 93 (~3.72s, may OOM on T4). Longer audio auto-generates multiple segments.",
+    "num_frames": 49,
+
+    "__comment_save_fps__": "Output video frames per second. Default 25 (standard for v1.5). Common values: 24, 25, 30.",
+    "save_fps": 25,
+
+    "__comment_ref_img_index__": "Reference image frame index (0-30). Controls how much the generated frames resemble the conditioning image. Lower = more consistent with ref image, higher = more varied motion (but may look less like the input). Recommended: 10.",
+    "ref_img_index": 10,
+
+    "__comment_mask_frame_range__": "Motion diversity control (1-10). Higher = fewer repeated/looping actions per segment. Too high (>5) can cause visual artifacts. Recommended: 3.",
+    "mask_frame_range": 3,
+
+    "__comment_negative_prompt__": "Describes what to avoid in the video. Change to steer away from specific artifacts. Leave empty string '' to disable.",
+    "negative_prompt": "Close-up, bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards",
+
+    "__comment_split_point__": "[Advanced] DiT block GPU split point. 48 total blocks split across 2 GPUs. 24 = even split (recommended). Lower values put more on GPU1 (e.g. 20 = 20 blocks GPU0, 28 blocks GPU1). Only change if one GPU has more VRAM than the other.",
+    "split_point": 24,
+
+    "__comment_use_distill__": "[Advanced] Enable distillation mode. REQUIRED for Avatar v1.5 — uses 8-step LoRA (dmd_lora). Set false only if using a non-distill checkpoint.",
+    "use_distill": true,
+
+    "__comment_use_int8__": "[Advanced] INT8 quantization for DiT model. Required for T4 GPUs (16GB). Disable only with >24GB GPUs.",
+    "use_int8": true,
+
+    "__comment_max_sequence_length__": "[Advanced] Maximum text token length. Default 512. Reduce to 256 if prompt is short to save memory.",
+    "max_sequence_length": 512,
+
+    "__comment_paths__": "=== File Paths (usually no need to change) ===",
+    "base_model_dir": "/kaggle/tmp/weights/LongCat-Video",
+    "avatar_model_dir": "/kaggle/tmp/weights/LongCat-Video-Avatar-1.5",
+    "input_json": "/kaggle/tmp/input.json",
+    "output_dir": "/kaggle/working"
+}

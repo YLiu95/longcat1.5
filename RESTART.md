@@ -2,6 +2,13 @@
 
 If the Kaggle session crashes/restarts, follow these steps to restore everything.
 
+## Branches
+
+- **`main`** — Last known stable state (Run 17)
+- **`experiment`** — Latest code with configurable settings + async GPU prefetch
+
+Use `experiment` for the latest features. Use `main` to roll back if `experiment` has issues.
+
 ## Step 1: Install Dependencies (~2 min)
 
 ```bash
@@ -35,7 +42,11 @@ huggingface-cli download meituan-longcat/LongCat-Video-Avatar-1.5 \
 ```bash
 source /root/.env
 cd /kaggle/tmp
-git clone https://${GITHUB_TOKEN}@github.com/YLiu95/longcat1.5.git backup-restore
+
+# Clone the experiment branch (latest code with config support + async prefetch)
+git clone -b experiment https://${GITHUB_TOKEN}@github.com/YLiu95/longcat1.5.git backup-restore
+# Or use main branch for stable fallback:
+# git clone -b main https://${GITHUB_TOKEN}@github.com/YLiu95/longcat1.5.git backup-restore
 
 # Copy modified inference script
 cp backup-restore/run_kaggle_avatar.py /kaggle/tmp/LongCat-Video/
@@ -44,15 +55,21 @@ cp backup-restore/run_kaggle_avatar.py /kaggle/tmp/LongCat-Video/
 cp backup-restore/attention_patched.py /kaggle/tmp/LongCat-Video/longcat_video/modules/attention.py
 cp backup-restore/avatar_attention_patched.py /kaggle/tmp/LongCat-Video/longcat_video/modules/avatar/attention.py
 
-# Copy input config
+# Copy config and input files
+cp backup-restore/config.json /kaggle/tmp/
 cp backup-restore/input.json /kaggle/tmp/
 ```
 
-## Step 5: Run Inference
+## Step 5: (Optional) Edit Settings
+
+Edit `/kaggle/tmp/config.json` to change output name, resolution, or other settings.
+See the `__comment_*` keys in the JSON for documentation on each setting.
+
+## Step 6: Run Inference
 
 ```bash
 cd /kaggle/tmp/LongCat-Video
-python -u run_kaggle_avatar.py > /kaggle/working/run.log 2>&1
+python -u run_kaggle_avatar.py --config /kaggle/tmp/config.json > /kaggle/working/run.log 2>&1
 ```
 
 Monitor progress:
@@ -60,18 +77,17 @@ Monitor progress:
 tail -f /kaggle/working/run.log
 ```
 
+## ⚠️ Before Running Risky Processes
+
+If you're about to run something that might OOM and crash the session:
+
+1. **Save your work**: `cd /kaggle/tmp/backup-repo && git add -A && git commit -m "pre-risk checkpoint" && source /root/.env && git push https://YLiu95:${GITHUB_TOKEN}@github.com/YLiu95/longcat1.5.git experiment`
+2. **Check memory headroom**: Run `cat /sys/fs/cgroup/memory.current` and `cat /sys/fs/cgroup/memory.max` — ensure at least 4GB free
+3. **Drop page cache first**: `echo 3 > /proc/sys/vm/drop_caches` (if available)
+4. **Phase 1-3 cache**: If `/kaggle/working/phase123_cache.pt` exists, the script will skip the 30GB model loading phases on restart
+
 ## Expected Output
 
-- Video: `/kaggle/working/output.mp4`
+- Video: `/kaggle/working/{output_name}.mp4` (default: `output.mp4`)
 - Log: `/kaggle/working/run.log`
-- Settings: 480×832, 25fps, 8 denoising steps (distill mode)
-- Multi-segment: 49 frames per segment, segments auto-calculated from audio length
-- Runtime: ~44 min per segment for DiT denoising
-
-## Memory Safety Notes
-
-- DiT uses pipeline parallelism: blocks 0-23 on GPU0, blocks 24-47 on GPU1
-- Each GPU uses ~8GB for model weights + ~3-5GB for activations
-- Max 49 frames per segment to stay within T4 memory limits
-- PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True is set in the script
-- Text encoder, audio encoder, and VAE use load-run-unload pattern
+- Phase cache: `/kaggle/working/phase123_cache.pt` (reused on restart)

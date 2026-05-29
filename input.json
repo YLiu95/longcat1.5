@@ -1,7 +1,7 @@
 {
-    "prompt": "Static camera. An important Chinese political leader giving a speech to a large group of top tier elite officials. He smiles slightly and gestures gently with his right hand while speaking.",
-    "cond_image": "/kaggle/input/datasets/yliu95/trump-xi-voice/zhuxi_speech_832_480.png",
-    "cond_audio": {
-        "person1": "/kaggle/input/datasets/yliu95/trump-xi-voice/toushang sanchi you shenming 3s.wav"
-    }
+  "prompt": "Static camera. An important Chinese political leader giving a speech to a large group of top tier elite officials. He gestures gently with his right hand while speaking.",
+  "cond_image": "/kaggle/input/datasets/yliu95/trump-xi-voice/zhuxi_speech_832_480.png",
+  "cond_audio": {
+    "person1": "/kaggle/input/datasets/yliu95/trump-xi-voice/toushang sanchi you shenming 3s.wav"
+  }
 }
