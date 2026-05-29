@@ -326,16 +326,20 @@ def split_dit_across_devices(model, device_0, device_1, split_point=24):
     model.t_embedder.to(device_0)
     model.y_embedder.to(device_0)
     model.audio_proj.to(device_0)
+    gc.collect()
 
-    # Split blocks
+    # Split blocks - with gc between groups to release CPU memory
     for i, block in enumerate(model.blocks):
         if i < split_point:
             block.to(device_0)
         else:
             block.to(device_1)
+        if i % 8 == 7:
+            gc.collect()
 
     # Final layer to device_1 (where last block output lives)
     model.final_layer.to(device_1)
+    gc.collect()
 
     return model
 
@@ -450,8 +454,34 @@ def run_dit_generation(
     log.info("=== Phase 4: DiT Generation ===")
     start = time.time()
 
-    # Free GPU reserved memory before loading DiT (frees ~6GB on GPU0)
+    # Aggressive cleanup before DiT load — drop file caches and free all GPU memory
     torch_gc()
+    import ctypes
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)  # return freed glibc heap to OS
+    except Exception:
+        pass
+    # Drop OS page cache (frees memory used by text encoder / whisper file mappings)
+    try:
+        with open('/proc/sys/vm/drop_caches', 'w') as f:
+            f.write('1\n')
+        log.info("  Dropped OS page cache")
+    except Exception:
+        pass
+
+    def log_rss(label=""):
+        import resource
+        rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+        try:
+            with open('/proc/self/status') as f:
+                for line in f:
+                    if line.startswith('VmRSS:'):
+                        rss_mb = int(line.split()[1]) / 1024
+                        break
+        except Exception:
+            pass
+        log.info(f"  CPU RAM [{label}]: RSS={rss_mb:.0f}MB")
+    log_rss("before DiT load")
 
     split_point = CONFIG["split_point"]
     num_inference_steps = CONFIG["num_inference_steps"]
@@ -468,6 +498,7 @@ def run_dit_generation(
     # Load DiT (INT8)
     log.info("  Loading INT8 DiT model...")
     dit = load_quantized_dit(avatar_model_dir, subfolder="base_model_int8", cp_split_hw=[1, 1])
+    log_rss("after DiT load")
     log_gpu_memory("DiT on CPU")
 
     # Load distillation LoRA (load weights only, enable after split)
@@ -476,6 +507,15 @@ def run_dit_generation(
         if os.path.exists(lora_path):
             log.info("  Loading distillation LoRA...")
             dit.load_lora(lora_path, "dmd", multiplier=1.0, lora_network_dim=128, lora_network_alpha=64)
+            log_rss("after LoRA load")
+
+    # Trim malloc before GPU split
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+    log_rss("before GPU split")
 
     # Split across GPUs
     dit = split_dit_across_devices(dit, device_0, device_1, split_point)
