@@ -24,6 +24,39 @@ from PIL import Image
 from tqdm import tqdm
 from einops import rearrange
 
+# Monkey-patch safetensors to evict each shard from page cache after loading.
+# The Kaggle cgroup counts file cache toward its 30GB memory limit, so we must
+# evict weight files (21.5GB text encoder, 15GB DiT, etc.) as soon as tensors
+# are materialized in RAM/GPU.
+import safetensors.torch
+_original_sf_load_file = safetensors.torch.load_file
+def _load_file_and_evict(filename, *args, **kwargs):
+    result = _original_sf_load_file(filename, *args, **kwargs)
+    try:
+        fd = os.open(str(filename), os.O_RDONLY)
+        size = os.fstat(fd).st_size
+        os.posix_fadvise(fd, 0, size, 4)  # POSIX_FADV_DONTNEED
+        os.close(fd)
+    except Exception:
+        pass
+    return result
+safetensors.torch.load_file = _load_file_and_evict
+
+# Also patch accelerate's load_state_dict which uses safe_open for device_map loading
+from accelerate.utils import modeling as _accel_modeling
+_original_load_state_dict = _accel_modeling.load_state_dict
+def _load_state_dict_and_evict(checkpoint_file, device_map=None):
+    result = _original_load_state_dict(checkpoint_file, device_map=device_map)
+    try:
+        fd = os.open(str(checkpoint_file), os.O_RDONLY)
+        size = os.fstat(fd).st_size
+        os.posix_fadvise(fd, 0, size, 4)  # POSIX_FADV_DONTNEED
+        os.close(fd)
+    except Exception:
+        pass
+    return result
+_accel_modeling.load_state_dict = _load_state_dict_and_evict
+
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
@@ -75,6 +108,74 @@ def log_gpu_memory(label=""):
         log.info(f"  GPU{i} [{label}]: {allocated:.2f}GB alloc / {peak:.2f}GB peak / {reserved:.2f}GB reserved / {total:.2f}GB total")
 
 
+def log_cgroup_memory(label=""):
+    """Log cgroup memory usage (the actual OOM limit on Kaggle)."""
+    try:
+        current = int(open('/sys/fs/cgroup/memory.current').read()) / 1024**2
+        peak = int(open('/sys/fs/cgroup/memory.peak').read()) / 1024**2
+        limit = int(open('/sys/fs/cgroup/memory.max').read()) / 1024**2
+        log.info(f"  cgroup [{label}]: {current:.0f}MB / {limit:.0f}MB (peak {peak:.0f}MB, headroom {limit-current:.0f}MB)")
+    except Exception:
+        pass
+
+
+def evict_file_cache(directory, pattern="*.safetensors"):
+    """Evict weight files from OS page cache using posix_fadvise DONTNEED."""
+    import glob
+    POSIX_FADV_DONTNEED = 4
+    evicted = 0
+    for filepath in glob.glob(os.path.join(directory, "**", pattern), recursive=True):
+        try:
+            fd = os.open(filepath, os.O_RDONLY)
+            size = os.fstat(fd).st_size
+            os.posix_fadvise(fd, 0, size, POSIX_FADV_DONTNEED)
+            os.close(fd)
+            evicted += size
+        except Exception:
+            pass
+    if evicted > 0:
+        log.info(f"  Evicted {evicted/1024**3:.1f}GB of weight files from page cache ({directory})")
+
+
+def force_reclaim_page_cache(target_gb=3.0, label=""):
+    """Force kernel to reclaim file page cache by allocating then freeing anonymous memory.
+    
+    The cgroup counts both anonymous and file-backed pages. By allocating anonymous
+    memory in chunks, we force the kernel to reclaim reclaimable file cache. After
+    freeing the anonymous memory, the net effect is reduced file cache in the cgroup.
+    """
+    import ctypes
+    libc = ctypes.CDLL("libc.so.6")
+    
+    # Use 8MB chunks - large enough for mmap (so glibc returns to OS on free)
+    # but small enough to not spike past the cgroup limit
+    chunk_size = 8 * 1024 * 1024
+    target_bytes = int(target_gb * 1024**3)
+    max_chunks = target_bytes // chunk_size
+    
+    chunks = []
+    allocated = 0
+    for _ in range(max_chunks):
+        try:
+            # bytearray zero-initializes, which touches all pages
+            # forcing kernel to provide physical pages (reclaiming cache)
+            b = bytearray(chunk_size)
+            chunks.append(b)
+            allocated += chunk_size
+        except (MemoryError, OSError):
+            break
+    
+    # Free all - since chunks are large, glibc used mmap internally
+    # and will munmap on delete, returning memory to OS
+    del chunks
+    gc.collect()
+    libc.malloc_trim(0)
+    
+    if allocated > 0:
+        log.info(f"  Force-reclaimed ~{allocated/1024**3:.1f}GB page cache [{label}]")
+    log_cgroup_memory(f"after force-reclaim {label}")
+
+
 def torch_gc():
     gc.collect()
     torch.cuda.empty_cache()
@@ -111,6 +212,9 @@ def encode_text(prompt, negative_prompt, base_model_dir, device="cuda:0"):
         base_model_dir, subfolder="text_encoder", torch_dtype=torch.bfloat16,
         device_map="auto", max_memory=max_mem,
     ).eval()
+    # Immediately evict text encoder files from page cache (21.5GB!)
+    evict_file_cache(os.path.join(base_model_dir, "text_encoder"))
+    log_cgroup_memory("after text_encoder load+evict")
     log_gpu_memory("text_encoder loaded")
 
     max_seq_len = CONFIG["max_sequence_length"]
@@ -143,6 +247,8 @@ def encode_text(prompt, negative_prompt, base_model_dir, device="cuda:0"):
     torch_gc()
     log.info(f"  Text encoding done in {time.time()-start:.1f}s")
     log_gpu_memory("text_encoder unloaded")
+    evict_file_cache(os.path.join(base_model_dir, "text_encoder"))
+    log_cgroup_memory("after text_encoder evict")
 
     return prompt_embeds, prompt_mask, neg_embeds, neg_mask, caption_channels
 
@@ -254,6 +360,8 @@ def encode_audio(audio_path, avatar_model_dir, device="cuda:0", fps=25):
     torch_gc()
     log.info(f"  Audio encoding done in {time.time()-start:.1f}s")
     log_gpu_memory("whisper unloaded")
+    evict_file_cache(os.path.join(avatar_model_dir, "whisper-large-v3"))
+    log_cgroup_memory("after whisper evict")
 
     # Move to CPU temporarily 
     return audio_emb.cpu(), speech_array, sample_rate
@@ -310,6 +418,8 @@ def encode_image(image_path, base_model_dir, height, width, device="cuda:0"):
     torch_gc()
     log.info(f"  Image encoding done in {time.time()-start:.1f}s, latent shape: {cond_latent.shape}")
     log_gpu_memory("VAE unloaded")
+    evict_file_cache(os.path.join(base_model_dir, "vae"))
+    log_cgroup_memory("after VAE evict")
 
     return cond_latent.cpu(), vae_config
 
@@ -321,6 +431,8 @@ def split_dit_across_devices(model, device_0, device_1, split_point=24):
     """Split DiT model blocks across two GPUs for pipeline parallelism."""
     log.info(f"  Splitting DiT: blocks 0-{split_point-1} -> {device_0}, blocks {split_point}-{len(model.blocks)-1} -> {device_1}")
 
+    avatar_model_dir = CONFIG["avatar_model_dir"]
+
     # Move shared components to device_0
     model.x_embedder.to(device_0)
     model.t_embedder.to(device_0)
@@ -328,7 +440,7 @@ def split_dit_across_devices(model, device_0, device_1, split_point=24):
     model.audio_proj.to(device_0)
     gc.collect()
 
-    # Split blocks - with gc between groups to release CPU memory
+    # Split blocks - with gc + eviction between groups
     for i, block in enumerate(model.blocks):
         if i < split_point:
             block.to(device_0)
@@ -340,6 +452,13 @@ def split_dit_across_devices(model, device_0, device_1, split_point=24):
     # Final layer to device_1 (where last block output lives)
     model.final_layer.to(device_1)
     gc.collect()
+
+    # All CPU tensor refs replaced by GPU refs now - evict weight files
+    evict_file_cache(os.path.join(avatar_model_dir, "base_model_int8"))
+    evict_file_cache(os.path.join(avatar_model_dir, "lora"))
+
+    # Force kernel to reclaim stale page cache (cgroup counts it toward limit)
+    force_reclaim_page_cache(target_gb=4.0, label="in split")
 
     return model
 
@@ -454,20 +573,25 @@ def run_dit_generation(
     log.info("=== Phase 4: DiT Generation ===")
     start = time.time()
 
-    # Aggressive cleanup before DiT load — drop file caches and free all GPU memory
+    # Aggressive cleanup before DiT load
     torch_gc()
     import ctypes
     try:
         ctypes.CDLL("libc.so.6").malloc_trim(0)  # return freed glibc heap to OS
     except Exception:
         pass
-    # Drop OS page cache (frees memory used by text encoder / whisper file mappings)
-    try:
-        with open('/proc/sys/vm/drop_caches', 'w') as f:
-            f.write('1\n')
-        log.info("  Dropped OS page cache")
-    except Exception:
-        pass
+    # Evict ALL weight files and libraries from page cache (cgroup counts file cache!)
+    import glob as _glob
+    for _dir in ['/kaggle/tmp/weights', '/usr/local/lib/python3.12']:
+        for _f in _glob.glob(os.path.join(_dir, '**', '*'), recursive=True):
+            if os.path.isfile(_f):
+                try:
+                    _fd = os.open(_f, os.O_RDONLY)
+                    os.posix_fadvise(_fd, 0, os.fstat(_fd).st_size, 4)
+                    os.close(_fd)
+                except Exception:
+                    pass
+    log_cgroup_memory("after Phase 4 cleanup")
 
     def log_rss(label=""):
         import resource
@@ -515,6 +639,11 @@ def run_dit_generation(
         ctypes.CDLL("libc.so.6").malloc_trim(0)
     except Exception:
         pass
+
+    # Evict DiT and LoRA weight files from page cache before GPU split
+    evict_file_cache(os.path.join(avatar_model_dir, "base_model_int8"))
+    evict_file_cache(os.path.join(avatar_model_dir, "lora"))
+    log_cgroup_memory("before GPU split")
     log_rss("before GPU split")
 
     # Split across GPUs
@@ -533,6 +662,10 @@ def run_dit_generation(
             module.enable_bsa = False
 
     log_gpu_memory("DiT split across GPUs")
+    log_cgroup_memory("after GPU split")
+
+    # Force reclaim again after LoRA setup
+    force_reclaim_page_cache(target_gb=4.0, label="after split+LoRA")
 
     # Enable LoRA after split - move each LoRA to the device of its target module
     if use_distill and "dmd" in dit.lora_dict:
@@ -636,9 +769,11 @@ def run_dit_generation(
         timesteps = scheduler.timesteps
 
         log.info(f"  Denoising: {len(timesteps)} steps, {'CFG' if do_cfg else 'no CFG'}")
+        force_reclaim_page_cache(target_gb=2.0, label=f"pre-denoise seg {seg_idx+1}")
         log.info(f"  Latent shape: {latents.shape}, Audio embs: {audio_embs.shape}")
 
         torch_gc()
+        log_cgroup_memory(f"before denoising seg {seg_idx+1}")
         log_gpu_memory(f"Before denoising seg {seg_idx+1}")
 
         # Denoising loop for this segment
@@ -836,6 +971,10 @@ def main():
     log.info("LongCat-Video-Avatar-1.5 Inference on Kaggle 2xT4")
     log.info("=" * 60)
 
+    # Evict any stale weight files from page cache at startup
+    evict_file_cache("/kaggle/tmp/weights")
+    log_cgroup_memory("startup")
+
     # GPU check
     num_gpus = torch.cuda.device_count()
     log.info(f"GPUs available: {num_gpus}")
@@ -884,23 +1023,63 @@ def main():
     log.info(f"Input: image={image_path}, audio={audio_path}")
     log.info(f"Settings: {height}x{width}, max {max_segment_frames} frames/segment, {fps}fps, {CONFIG['num_inference_steps']} steps")
 
-    # ---- Phase 1: Text Encoding ----
-    prompt_embeds, prompt_mask, neg_embeds, neg_mask, caption_channels = encode_text(
-        prompt, negative_prompt, base_model_dir, device=device_0
-    )
+    # Cache path for phase 1-3 outputs (avoids reloading 30GB of models on retry)
+    cache_path = os.path.join(CONFIG["output_dir"], "phase123_cache.pt")
 
-    # ---- Phase 2: Audio Encoding ----
-    audio_emb_cpu, speech_array, sample_rate = encode_audio(
-        audio_path, avatar_model_dir, device=device_0, fps=fps
-    )
+    if os.path.exists(cache_path):
+        log.info(f"  Loading cached phase 1-3 outputs from {cache_path}")
+        cache = torch.load(cache_path, map_location="cpu", weights_only=False)
+        prompt_embeds = cache["prompt_embeds"]
+        prompt_mask = cache["prompt_mask"]
+        neg_embeds = cache["neg_embeds"]
+        neg_mask = cache["neg_mask"]
+        caption_channels = cache["caption_channels"]
+        audio_emb_cpu = cache["audio_emb_cpu"]
+        audio_duration = cache["audio_duration"].item()
+        cond_latent = cache["cond_latent"]
+        vae_config = cache["vae_config"]
+        del cache
+        gc.collect()
+        log.info(f"  Cached outputs loaded. Audio: {audio_duration:.2f}s")
+        log_cgroup_memory("after cache load")
+    else:
+        # ---- Phase 1: Text Encoding ----
+        prompt_embeds, prompt_mask, neg_embeds, neg_mask, caption_channels = encode_text(
+            prompt, negative_prompt, base_model_dir, device=device_0
+        )
 
-    # ---- Phase 3: Image VAE Encoding ----
-    cond_latent, vae_config = encode_image(
-        image_path, base_model_dir, height, width, device=device_0
-    )
+        # ---- Phase 2: Audio Encoding ----
+        audio_emb_cpu, speech_array, sample_rate = encode_audio(
+            audio_path, avatar_model_dir, device=device_0, fps=fps
+        )
+
+        # ---- Phase 3: Image VAE Encoding ----
+        cond_latent, vae_config = encode_image(
+            image_path, base_model_dir, height, width, device=device_0
+        )
+
+        audio_duration = len(speech_array) / sample_rate
+
+        # Save cache for fast retry
+        log.info(f"  Saving phase 1-3 cache to {cache_path}")
+        torch.save({
+            "prompt_embeds": prompt_embeds.cpu(),
+            "prompt_mask": prompt_mask.cpu(),
+            "neg_embeds": neg_embeds.cpu(),
+            "neg_mask": neg_mask.cpu(),
+            "caption_channels": caption_channels,
+            "audio_emb_cpu": audio_emb_cpu.cpu(),
+            "audio_duration": torch.tensor(audio_duration),
+            "cond_latent": cond_latent.cpu(),
+            "vae_config": vae_config,
+        }, cache_path)
+        log.info(f"  Phase 1-3 cache saved ({os.path.getsize(cache_path)/1024**2:.1f}MB)")
+
+        # Free phase 1-3 intermediates
+        del speech_array
+        torch_gc()
 
     # Calculate total video frames from audio duration
-    audio_duration = len(speech_array) / sample_rate
     total_video_frames = max(int(audio_duration * fps), max_segment_frames)
     log.info(f"Audio: {audio_duration:.2f}s -> {total_video_frames} total video frames")
 

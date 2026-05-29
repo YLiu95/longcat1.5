@@ -100,8 +100,15 @@ class Attention(nn.Module):
             x = xformers.ops.memory_efficient_attention(q, k, v, attn_bias=None, op=None,)
             x = rearrange(x, "B M H K -> B H M K")
         else:
-            # SDPA fallback: q,k,v are [B, H, S, D]
-            x = torch.nn.functional.scaled_dot_product_attention(q, k, v, scale=self.scale)
+            # SDPA fallback: cast to fp16 for T4 mem-efficient kernel
+            from torch.nn.attention import SDPBackend, sdpa_kernel
+            orig_dtype = q.dtype
+            q_f16 = q.to(torch.float16)
+            k_f16 = k.to(torch.float16)
+            v_f16 = v.to(torch.float16)
+            with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
+                x = torch.nn.functional.scaled_dot_product_attention(q_f16, k_f16, v_f16, scale=self.scale)
+            x = x.to(orig_dtype)
 
         return x
 
@@ -261,7 +268,13 @@ class MultiHeadCrossAttention(nn.Module):
                 qi = qi.unsqueeze(0).transpose(1, 2)  # [1, H, N, D]
                 ki = ki.unsqueeze(0).transpose(1, 2)
                 vi = vi.unsqueeze(0).transpose(1, 2)
-                o = torch.nn.functional.scaled_dot_product_attention(qi, ki, vi)
+                from torch.nn.attention import SDPBackend, sdpa_kernel
+                qi_f16 = qi.to(torch.float16)
+                ki_f16 = ki.to(torch.float16)
+                vi_f16 = vi.to(torch.float16)
+                with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
+                    o = torch.nn.functional.scaled_dot_product_attention(qi_f16, ki_f16, vi_f16)
+                o = o.to(qi.dtype)
                 outputs.append(o.transpose(1, 2).squeeze(0))  # [N, H, D]
             x = torch.stack(outputs, dim=0).unsqueeze(0)  # [1, B, N, H, D] -> reshape
             x = x.view(B, N, self.num_heads, self.head_dim)
