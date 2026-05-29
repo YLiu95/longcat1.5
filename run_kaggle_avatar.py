@@ -69,9 +69,10 @@ def log_gpu_memory(label=""):
     for i in range(torch.cuda.device_count()):
         allocated = torch.cuda.memory_allocated(i) / 1024**3
         reserved = torch.cuda.memory_reserved(i) / 1024**3
+        peak = torch.cuda.max_memory_allocated(i) / 1024**3
         total = (getattr(torch.cuda.get_device_properties(i), 'total_memory', None) or 
                 getattr(torch.cuda.get_device_properties(i), 'total_mem', 0)) / 1024**3
-        log.info(f"  GPU{i} [{label}]: {allocated:.2f}GB alloc / {reserved:.2f}GB reserved / {total:.2f}GB total")
+        log.info(f"  GPU{i} [{label}]: {allocated:.2f}GB alloc / {peak:.2f}GB peak / {reserved:.2f}GB reserved / {total:.2f}GB total")
 
 
 def torch_gc():
@@ -439,10 +440,10 @@ def run_dit_generation(
     base_model_dir, avatar_model_dir, vae_config,
     prompt_embeds, prompt_mask, neg_embeds, neg_mask,
     cond_latent, audio_emb_cpu,
-    height, width, num_frames, caption_channels,
+    height, width, total_video_frames, max_segment_frames, caption_channels,
     device_0="cuda:0", device_1="cuda:1",
 ):
-    """Run DiT denoising loop with pipeline parallelism."""
+    """Run DiT denoising loop with pipeline parallelism (multi-segment)."""
     from longcat_video.modules.quantization import load_quantized_dit
     from longcat_video.modules.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
 
@@ -518,7 +519,7 @@ def run_dit_generation(
             module.forward = dit._create_multi_lora_forward(module, loras)
         dit.active_loras.append("dmd")
 
-    # Prepare timesteps
+    # Prepare timesteps/sigmas
     _num_timesteps = 1000
     _num_distill_sample_steps = 8
     if use_distill:
@@ -531,126 +532,153 @@ def run_dit_generation(
         sigmas = torch.linspace(1, 0.001, num_inference_steps)
     sigmas = sigmas.to(torch.float32)
 
-    scheduler.set_timesteps(num_inference_steps, sigmas=sigmas, device=device_0)
-    timesteps = scheduler.timesteps
-
-    # Prepare latents
+    # Latent dimensions
     vae_scale_temporal = vae_config["scale_factor_temporal"]
     vae_scale_spatial = vae_config["scale_factor_spatial"]
-    num_channels_latents = 16  # dit.config.in_channels
+    num_channels_latents = 16
 
-    num_latent_frames = (num_frames - 1) // vae_scale_temporal + 1
+    num_latent_frames = (max_segment_frames - 1) // vae_scale_temporal + 1
     latent_h = height // vae_scale_spatial
     latent_w = width // vae_scale_spatial
     shape = (1, num_channels_latents, num_latent_frames, latent_h, latent_w)
 
     generator = torch.Generator(device=device_0).manual_seed(seed)
-    latents = torch.randn(shape, generator=generator, device=device_0, dtype=torch.float32)
-
-    # Set conditioning image latent
-    cond_latent = cond_latent.to(device_0)
-    latents[:, :, :1] = cond_latent
-
-    # Prepare audio embeddings for DiT
-    # audio_emb is [T, 5, D], need to expand for all frames
-    audio_emb = audio_emb_cpu.to(device_0)
-
-    # Build audio_embs tensor: [B, T_audio, W, S, C]
-    # For AI2V: fps=25, audio_stride=1
-    audio_stride = 1
-    audio_window = 5  # from model config
-    indices = torch.arange(2 * 2 + 1) - 2  # [-2, -1, 0, 1, 2]
-    audio_start_idx = 0
-    audio_end_idx = audio_start_idx + audio_stride * num_frames
-    center_indices = torch.arange(audio_start_idx, audio_end_idx, audio_stride).unsqueeze(1) + indices.unsqueeze(0)
-    center_indices = torch.clamp(center_indices, min=0, max=audio_emb.shape[0] - 1)
-    audio_embs = audio_emb[center_indices][None, ...].to(device_0)  # [1, T, W, S, C]
 
     do_cfg = text_guidance_scale > 1.0 or audio_guidance_scale > 1.0
 
-    # Prepare embeddings
+    # Prepare text embeddings (same for all segments)
     prompt_embeds = prompt_embeds.to(device_0)
     prompt_mask = prompt_mask.to(device_0)
     neg_embeds = neg_embeds.to(device_0)
     neg_mask = neg_mask.to(device_0)
 
-    if do_cfg:
-        combined_embeds = torch.cat([neg_embeds, prompt_embeds], dim=0)
-        combined_mask = torch.cat([neg_mask, prompt_mask], dim=0)
-        audio_uncond_embs = torch.zeros_like(audio_embs)
-        combined_audio = torch.cat([audio_embs, audio_embs], dim=0)
+    # Calculate segments
+    new_per_seg = max_segment_frames - 1  # new frames per segment (excl. conditioning frame)
+    if total_video_frames <= max_segment_frames:
+        num_segments = 1
+    else:
+        num_segments = 1 + math.ceil((total_video_frames - max_segment_frames) / new_per_seg)
 
-    log.info(f"  Starting denoising: {len(timesteps)} steps, {'CFG' if do_cfg else 'no CFG'}")
-    log.info(f"  Latent shape: {latents.shape}, Audio embs: {audio_embs.shape}")
+    log.info(f"  Multi-segment: {num_segments} segment(s) of {max_segment_frames} frames, total target: {total_video_frames} frames")
 
-    # Free fragmented GPU memory before denoising
-    torch_gc()
-    log_gpu_memory("Before denoising")
+    # Audio window parameters
+    audio_window = 5
+    audio_stride = 1
+    aw_indices = torch.arange(audio_window) - audio_window // 2  # [-2, -1, 0, 1, 2]
 
-    # Denoising loop
-    with torch.no_grad():
-        for i, t in enumerate(tqdm(timesteps, desc="Denoising")):
-            step_start = time.time()
+    all_segment_latents = []
+    current_cond_latent = cond_latent.to(device_0)
 
-            if do_cfg:
-                latent_model_input = torch.cat([latents] * 2)
-                timestep = t.expand(2).to(dtype=torch.bfloat16)
-                timestep = timestep.unsqueeze(-1).repeat(1, latent_model_input.shape[2])
-                timestep[:, :1] = 0
+    for seg_idx in range(num_segments):
+        seg_start = time.time()
+        log.info(f"  --- Segment {seg_idx+1}/{num_segments} ---")
 
-                noise_pred = dit_forward_split(
-                    dit, latent_model_input, timestep,
-                    combined_embeds, combined_mask,
-                    num_cond_latents=1,
-                    audio_embs=combined_audio,
-                    split_point=split_point,
-                    device_0=device_0, device_1=device_1,
-                )
+        # Build audio embeddings for this segment
+        frame_offset = seg_idx * new_per_seg
+        audio_emb = audio_emb_cpu.to(device_0)
+        center_indices = torch.arange(frame_offset, frame_offset + max_segment_frames, audio_stride).unsqueeze(1) + aw_indices.unsqueeze(0)
+        center_indices = torch.clamp(center_indices, 0, audio_emb.shape[0] - 1)
+        audio_embs = audio_emb[center_indices][None, ...]  # [1, T, W, S, C]
+        del audio_emb
 
-                # Also get unconditioned prediction
-                timestep_uncond = t.expand(1).to(dtype=torch.bfloat16)
-                timestep_uncond = timestep_uncond.unsqueeze(-1).repeat(1, latents.shape[2])
-                timestep_uncond[:, :1] = 0
+        if do_cfg:
+            audio_uncond_embs = torch.zeros_like(audio_embs)
+            combined_audio = torch.cat([audio_embs, audio_embs], dim=0)
+            combined_embeds = torch.cat([neg_embeds, prompt_embeds], dim=0)
+            combined_mask = torch.cat([neg_mask, prompt_mask], dim=0)
 
-                noise_pred_uncond = dit_forward_split(
-                    dit, latents, timestep_uncond,
-                    neg_embeds, neg_mask,
-                    num_cond_latents=1,
-                    audio_embs=audio_uncond_embs,
-                    split_point=split_point,
-                    device_0=device_0, device_1=device_1,
-                )
+        # Prepare latents for this segment
+        latents = torch.randn(shape, generator=generator, device=device_0, dtype=torch.float32)
+        latents[:, :, :1] = current_cond_latent
 
-                noise_pred_uncond_text, noise_pred_cond = noise_pred.chunk(2)
-                noise_pred_final = (noise_pred_uncond +
-                    text_guidance_scale * (noise_pred_cond - noise_pred_uncond_text) +
-                    audio_guidance_scale * (noise_pred_uncond_text - noise_pred_uncond))
-            else:
-                # No CFG - single forward pass
-                timestep = t.expand(1).to(dtype=torch.bfloat16)
-                timestep = timestep.unsqueeze(-1).repeat(1, latents.shape[2])
-                timestep[:, :1] = 0  # condition frame has t=0
+        # Reset scheduler for this segment
+        scheduler.set_timesteps(num_inference_steps, sigmas=sigmas, device=device_0)
+        timesteps = scheduler.timesteps
 
-                noise_pred_final = dit_forward_split(
-                    dit, latents, timestep,
-                    prompt_embeds, prompt_mask,
-                    num_cond_latents=1,
-                    audio_embs=audio_embs,
-                    split_point=split_point,
-                    device_0=device_0, device_1=device_1,
-                )
+        log.info(f"  Denoising: {len(timesteps)} steps, {'CFG' if do_cfg else 'no CFG'}")
+        log.info(f"  Latent shape: {latents.shape}, Audio embs: {audio_embs.shape}")
 
-            # Negate for scheduler compatibility
-            noise_pred_final = -noise_pred_final
+        torch_gc()
+        log_gpu_memory(f"Before denoising seg {seg_idx+1}")
 
-            # Update latents (only noise frames, not condition frame)
-            latents[:, :, 1:] = scheduler.step(
-                noise_pred_final[:, :, 1:], t, latents[:, :, 1:], return_dict=False
-            )[0]
+        # Denoising loop for this segment
+        with torch.no_grad():
+            for i, t_val in enumerate(tqdm(timesteps, desc=f"Denoising seg {seg_idx+1}")):
+                step_start = time.time()
 
-            step_time = time.time() - step_start
-            if i == 0 or (i + 1) % 4 == 0:
-                log.info(f"  Step {i+1}/{len(timesteps)}: {step_time:.1f}s")
+                if do_cfg:
+                    latent_model_input = torch.cat([latents] * 2)
+                    timestep = t_val.expand(2).to(dtype=torch.bfloat16)
+                    timestep = timestep.unsqueeze(-1).repeat(1, latent_model_input.shape[2])
+                    timestep[:, :1] = 0
+
+                    noise_pred = dit_forward_split(
+                        dit, latent_model_input, timestep,
+                        combined_embeds, combined_mask,
+                        num_cond_latents=1,
+                        audio_embs=combined_audio,
+                        split_point=split_point,
+                        device_0=device_0, device_1=device_1,
+                    )
+
+                    timestep_uncond = t_val.expand(1).to(dtype=torch.bfloat16)
+                    timestep_uncond = timestep_uncond.unsqueeze(-1).repeat(1, latents.shape[2])
+                    timestep_uncond[:, :1] = 0
+
+                    noise_pred_uncond = dit_forward_split(
+                        dit, latents, timestep_uncond,
+                        neg_embeds, neg_mask,
+                        num_cond_latents=1,
+                        audio_embs=audio_uncond_embs,
+                        split_point=split_point,
+                        device_0=device_0, device_1=device_1,
+                    )
+
+                    noise_pred_uncond_text, noise_pred_cond = noise_pred.chunk(2)
+                    noise_pred_final = (noise_pred_uncond +
+                        text_guidance_scale * (noise_pred_cond - noise_pred_uncond_text) +
+                        audio_guidance_scale * (noise_pred_uncond_text - noise_pred_uncond))
+                else:
+                    # No CFG - single forward pass
+                    timestep = t_val.expand(1).to(dtype=torch.bfloat16)
+                    timestep = timestep.unsqueeze(-1).repeat(1, latents.shape[2])
+                    timestep[:, :1] = 0  # condition frame has t=0
+
+                    noise_pred_final = dit_forward_split(
+                        dit, latents, timestep,
+                        prompt_embeds, prompt_mask,
+                        num_cond_latents=1,
+                        audio_embs=audio_embs,
+                        split_point=split_point,
+                        device_0=device_0, device_1=device_1,
+                    )
+
+                # Negate for scheduler compatibility
+                noise_pred_final = -noise_pred_final
+
+                # Update latents (only noise frames, not condition frame)
+                latents[:, :, 1:] = scheduler.step(
+                    noise_pred_final[:, :, 1:], t_val, latents[:, :, 1:], return_dict=False
+                )[0]
+
+                step_time = time.time() - step_start
+                if i == 0 or (i + 1) % 4 == 0:
+                    log.info(f"  Step {i+1}/{len(timesteps)}: {step_time:.1f}s")
+
+        # Save segment latents to CPU
+        all_segment_latents.append(latents.cpu())
+
+        # Set conditioning for next segment: last latent frame
+        current_cond_latent = latents[:, :, -1:].clone()
+
+        del latents, audio_embs
+        if do_cfg:
+            del audio_uncond_embs, combined_audio
+        torch_gc()
+
+        seg_time = time.time() - seg_start
+        log.info(f"  Segment {seg_idx+1} done in {seg_time:.1f}s ({seg_time/60:.1f}min)")
+        log_gpu_memory(f"After segment {seg_idx+1}")
 
     log.info(f"  DiT generation done in {time.time()-start:.1f}s")
 
@@ -659,14 +687,15 @@ def run_dit_generation(
     torch_gc()
     log_gpu_memory("DiT unloaded")
 
-    return latents
+    return all_segment_latents
 
 
 # ============================================================
 # Phase 5: VAE Decode & Save (load-run-unload on GPU0)
 # ============================================================
-def decode_and_save(latents, base_model_dir, vae_config, audio_path, output_dir, fps=25):
-    """Decode latents with VAE and save video. Load-run-unload pattern."""
+def decode_and_save(all_segment_latents, base_model_dir, vae_config, audio_path,
+                    output_dir, fps, total_video_frames):
+    """Decode multi-segment latents with VAE and save video with audio."""
     from longcat_video.modules.autoencoder_kl_wan import AutoencoderKLWan
     from diffusers.video_processor import VideoProcessor
 
@@ -681,27 +710,44 @@ def decode_and_save(latents, base_model_dir, vae_config, audio_path, output_dir,
     ).to(device).eval()
     log_gpu_memory("VAE loaded for decode")
 
-    # Denormalize latents
-    latents = latents.to(device, dtype=torch.bfloat16)
-    latents_mean = torch.tensor(vae_config["latents_mean"]).view(1, -1, 1, 1, 1).to(device, torch.bfloat16)
-    latents_std = 1.0 / torch.tensor(vae_config["latents_std"]).view(1, -1, 1, 1, 1).to(device, torch.bfloat16)
-    latents = latents / latents_std + latents_mean
-
-    # Decode
-    with torch.no_grad():
-        output_video = vae.decode(latents, return_dict=False)[0]
-
-    # Post-process
     video_processor = VideoProcessor(vae_scale_factor=vae_config["scale_factor_spatial"])
-    output_video = video_processor.postprocess_video(output_video)  # numpy [B, T, H, W, C]
+    all_frames = []
+
+    for seg_idx, seg_latents in enumerate(all_segment_latents):
+        log.info(f"  Decoding segment {seg_idx+1}/{len(all_segment_latents)}...")
+
+        latents = seg_latents.to(device, dtype=torch.bfloat16)
+        latents_mean = torch.tensor(vae_config["latents_mean"]).view(1, -1, 1, 1, 1).to(device, torch.bfloat16)
+        latents_std = 1.0 / torch.tensor(vae_config["latents_std"]).view(1, -1, 1, 1, 1).to(device, torch.bfloat16)
+        latents = latents / latents_std + latents_mean
+
+        with torch.no_grad():
+            output_video = vae.decode(latents, return_dict=False)[0]
+
+        segment_frames = video_processor.postprocess_video(output_video)[0]  # [T, H, W, C]
+
+        if seg_idx == 0:
+            all_frames.append(segment_frames)
+        else:
+            # Skip first frame (conditioning frame = last frame of previous segment)
+            all_frames.append(segment_frames[1:])
+
+        log.info(f"  Segment {seg_idx+1} decoded: {segment_frames.shape}")
+        del latents, output_video
+        torch_gc()
 
     # Unload VAE
     del vae
     torch_gc()
 
-    # Save video with ffmpeg
-    video_frames = output_video[0]  # [T, H, W, C]
-    log.info(f"  Video decoded: {video_frames.shape}")
+    # Concatenate all segments
+    video_frames = np.concatenate(all_frames, axis=0)
+
+    # Trim to total_video_frames
+    if video_frames.shape[0] > total_video_frames:
+        video_frames = video_frames[:total_video_frames]
+
+    log.info(f"  Video decoded: {video_frames.shape} ({video_frames.shape[0]} frames, target was {total_video_frames})")
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -718,31 +764,23 @@ def decode_and_save(latents, base_model_dir, vae_config, audio_path, output_dir,
         writer.append_data(frame)
     writer.close()
 
-    # Merge audio with video
-    T_frames = video_np.shape[0]
-    duration = T_frames / fps
-    save_path_crop_audio = save_path + "-cropaudio.wav"
-    subprocess.run([
-        "ffmpeg", "-y", "-i", audio_path,
-        "-t", f"{duration}", save_path_crop_audio
-    ], check=True, capture_output=True)
-
+    # Mux with FULL original audio (video duration matches audio via multi-segment)
     final_path = save_path + ".mp4"
     subprocess.run([
         "ffmpeg", "-y",
         "-i", save_path_tmp,
-        "-i", save_path_crop_audio,
+        "-i", audio_path,
         "-c:v", "libx264", "-crf", "18",
         "-c:a", "aac", "-b:a", "128k",
         "-shortest", final_path
     ], check=True, capture_output=True)
 
-    # Cleanup temp files
-    for f in [save_path_tmp, save_path_crop_audio]:
-        if os.path.exists(f):
-            os.remove(f)
+    # Cleanup temp file
+    if os.path.exists(save_path_tmp):
+        os.remove(save_path_tmp)
 
     log.info(f"  Video saved to {final_path}")
+    log.info(f"  Duration: {video_frames.shape[0]/fps:.2f}s video, audio from original file")
     log.info(f"  VAE decode & save done in {time.time()-start:.1f}s")
     log_gpu_memory("after decode & save")
 
@@ -800,11 +838,11 @@ def main():
     else:
         height, width = 480, 832
 
-    num_frames = CONFIG["num_frames"]
+    max_segment_frames = CONFIG["num_frames"]  # max frames per segment
     fps = CONFIG["save_fps"]
 
     log.info(f"Input: image={image_path}, audio={audio_path}")
-    log.info(f"Settings: {height}x{width}, {num_frames} frames, {fps}fps, {CONFIG['num_inference_steps']} steps")
+    log.info(f"Settings: {height}x{width}, max {max_segment_frames} frames/segment, {fps}fps, {CONFIG['num_inference_steps']} steps")
 
     # ---- Phase 1: Text Encoding ----
     prompt_embeds, prompt_mask, neg_embeds, neg_mask, caption_channels = encode_text(
@@ -821,19 +859,24 @@ def main():
         image_path, base_model_dir, height, width, device=device_0
     )
 
-    # ---- Phase 4: DiT Generation ----
-    latents = run_dit_generation(
+    # Calculate total video frames from audio duration
+    audio_duration = len(speech_array) / sample_rate
+    total_video_frames = max(int(audio_duration * fps), max_segment_frames)
+    log.info(f"Audio: {audio_duration:.2f}s -> {total_video_frames} total video frames")
+
+    # ---- Phase 4: DiT Generation (multi-segment) ----
+    all_segment_latents = run_dit_generation(
         base_model_dir, avatar_model_dir, vae_config,
         prompt_embeds, prompt_mask, neg_embeds, neg_mask,
         cond_latent, audio_emb_cpu,
-        height, width, num_frames, caption_channels,
+        height, width, total_video_frames, max_segment_frames, caption_channels,
         device_0=device_0, device_1=device_1,
     )
 
     # ---- Phase 5: VAE Decode & Save ----
     output_path = decode_and_save(
-        latents, base_model_dir, vae_config,
-        audio_path, CONFIG["output_dir"], fps=fps
+        all_segment_latents, base_model_dir, vae_config,
+        audio_path, CONFIG["output_dir"], fps, total_video_frames
     )
 
     total_time = time.time() - total_start
